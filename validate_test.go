@@ -256,6 +256,8 @@ func TestCollectionRules(t *testing.T) {
 		{"invalid len items", Validate(Field("s", []int{1}, LenItems[int](2))), "s: 数量必须为 2"},
 		{"unique", Validate(Field("s", []int{1, 2, 3}, Unique[int]())), ""},
 		{"invalid unique", Validate(Field("s", []int{1, 2, 2}, Unique[int]())), "s: 不能包含重复项 2"},
+		{"non empty map", Validate(Field("m", map[string]any{}, NonEmptyMap[string, any]())), "m: 不能为空"},
+		{"non empty map passes", Validate(Field("m", map[string]any{"a": 1}, NonEmptyMap[string, any]())), ""},
 		{"each", Validate(Field("s", []string{"a", "b"}, Each(Required()))), ""},
 		{"invalid each", Validate(Field("s", []string{"a", ""}, Each(Required()))), "s: 第 2 项不能为空"},
 	}

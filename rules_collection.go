@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -29,6 +30,17 @@ func LenItems[T any](exact int) Rule[[]T] {
 	return func(value []T) error {
 		if len(value) != exact {
 			return fmt.Errorf("数量必须为 %d", exact)
+		}
+		return nil
+	}
+}
+
+// NonEmptyMap rejects empty maps, matching the existing go-playground required
+// rule applied to map fields (len(map) > 0).
+func NonEmptyMap[K comparable, V any]() Rule[map[K]V] {
+	return func(value map[K]V) error {
+		if len(value) == 0 {
+			return errors.New("不能为空")
 		}
 		return nil
 	}

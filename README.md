@@ -121,6 +121,7 @@ if errors.As(err, &verrs) {
 | 规则 | 默认文案 |
 | --- | --- |
 | `MinItems(n)` / `MaxItems(n)` / `LenItems(n)` | `数量不能小于 n` 等 |
+| `NonEmptyMap[K, V]()` | `不能为空` |
 | `Unique[T]()` | `不能包含重复项 v` |
 | `Each[T](rules...)` | `第 N 项<规则文案>` |
 
