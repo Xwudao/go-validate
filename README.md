@@ -202,6 +202,173 @@ validate.Field("end_at", params.EndAt, validate.Func(func(end time.Time) error {
 }))
 ```
 
+## 机器可读元数据（Constraint / Spec / Schema）
+
+校验规则和接口文档常常是两份手写清单，容易「代码改了、文档没改」。
+`Constraint[T]` 把一条运行时规则和**同一条件**的元数据放在同一个构造函数里；
+`Spec` 用同一份声明同时产出**运行时校验**和**机器可读字段元数据**，两者不会漂移。
+
+```go
+type CreateUserRequest struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+    Age   int    `json:"age"`
+    Role  string `json:"role"`
+}
+
+// Spec 是唯一的声明入口。
+func (r CreateUserRequest) Spec() validate.Spec {
+    return validate.Spec{
+        validate.String("name", r.Name,
+            validate.NonEmpty(),
+            validate.MaxRunes(50),
+        ),
+        validate.String("email", r.Email,
+            validate.WithMessage("邮箱格式不正确", validate.EmailFormat()),
+        ),
+        validate.Int("age", r.Age,
+            validate.MinValue(18),
+            validate.MaxValue(120),
+        ),
+        validate.String("role", r.Role,
+            validate.Enum("admin", "member"),
+        ),
+    }
+}
+
+func (r CreateUserRequest) Validate() error { return r.Spec().Validate() }
+
+// Schema 不执行任何规则，可以在零值上调用。
+func (r CreateUserRequest) Schema() (validate.Schema, error) {
+    return r.Spec().Schema()
+}
+```
+
+`Schema.Fields` 是 JSON-Schema 中立的字段描述：`Name`、`Type`（`TypeString` /
+`TypeInteger` / `TypeNumber`）、`Required`、`Nullable`、`MinLength`、`MaxLength`、
+`Minimum`、`Maximum`、`Format`、`Enum`、`Unsupported`、`Invalid`。`Schema.Names()` 返回字段名，
+消费方（模板）可以据此和请求结构体的 JSON 标签比对，确保名字与 JSON 形状一致。
+
+### 约束一览（MVP）
+
+| 约束 | 运行时规则 | 元数据 |
+| --- | --- | --- |
+| `NonEmpty()` | 字符串非空 | `required` + `minLength: 1` |
+| `MinRunes(n)` / `MaxRunes(n)` | 按 **Unicode 码点**（rune）计数 | `minLength` / `maxLength` |
+| `EmailFormat()` | RFC 5322 邮箱 | `format: email` + `required` |
+| `Enum(values...)` | 枚举 | `enum`（零值不在集合内时为 `required`） |
+| `MinValue(n)` / `MaxValue(n)` | 数值上下界（`int` / `float64`） | `minimum` / `maximum` |
+| `WithMessage(msg, c)` | 替换文案 | **保留**内层全部元数据 |
+| `Conditional(cond, c)` | 条件为真才校验 | 标为 unsupported（见下） |
+| `Custom(rule)` | 自定义规则 | 标为 unsupported（见下） |
+
+### 必填 / presence 的差别
+
+- **值类型字段**（`String` / `Int` / `Float`）：JSON 绑定后「缺省」和「零值」无法区分，
+  因此只要某条约束会拒绝零值（如 `NonEmpty`、`MinValue(1)`、不含 `""` 的 `Enum`），
+  schema 就会输出 `required: true`。这正是运行时行为，不会出现文档说可选、运行时必填的错配。
+- **可选指针字段**（`OptionalString` / `OptionalInt` / `OptionalFloat`）：`nil` 表示缺省或
+  `null`，此时跳过全部约束，因此默认 `required: false`、`nullable: true`；约束只在「存在」时生效。
+  需要必填时显式调用 `.Required()`（会拒绝 `nil`，同时 `nullable` 变为 `false`）：
+
+  ```go
+  validate.OptionalString("nickname", r.Nickname).Required().MaxRunes(16)
+  ```
+
+### 无法表达的约束：明确报错，不静默漏写
+
+`Conditional`（动态条件）和 `Custom`（无元数据的自定义规则）在运行时照常校验，
+但**无法无条件写进文档**。`Spec.Schema()` 会返回一个 `validate.UnsupportedError`，
+逐字段列出原因；已支持的字段元数据仍会返回，消费方可自行决定是让开发者改用显式约束、
+还是手写该字段的文档：
+
+```go
+schema, err := req.Spec().Schema()
+if err != nil {
+    // 例如：unsupported constraints: company: conditional constraint has no unconditional machine-readable form
+    var unsupported validate.UnsupportedError
+    if errors.As(err, &unsupported) {
+        // 交给模板提示开发者补充该字段文档
+    }
+}
+```
+
+注意：`Spec` 方法必须是**无条件**的——字段集合和约束不能依赖接收者的值。
+需要条件校验时请使用 `Conditional`，让它以 unsupported 的形式显式暴露，而不是被静默漏掉。
+
+### 非法参数 / 重复字段：同样 fail-closed
+
+构造参数无法构成合法约束时不会 panic，也不会静默降级：`MinRunes`/`MaxRunes` 的负边界、
+空的 `Enum()`、非有限（`NaN`/`±Inf`）的 `MinValue`/`MaxValue`，以及相互矛盾的上下界
+（如 `MinRunes(5), MaxRunes(3)`）。这类约束的运行时规则**拒绝一切取值**（fail closed），
+`Schema()` 返回 `validate.InvalidError` 并逐字段列出原因，绝不输出非法的 JSON Schema：
+
+```go
+schema, err := req.Spec().Schema()
+if err != nil {
+    var invalid validate.InvalidError
+    if errors.As(err, &invalid) {
+        // 例如：invalid constraints: s: MinRunes requires min >= 0, got -1
+    }
+}
+```
+
+`Spec.Schema()` 还会校验字段名：空字段名和重复字段名都以 `InvalidError` 报错，
+避免生成含重复属性的文档。`UnsupportedError` 与 `InvalidError` 可能同时出现，
+此时返回的错误可用 `errors.As` 分别取出。
+
+此外，`Constraint.Meta()` 与 `Schema()` 返回的都是**防御性拷贝**（拥有自己的
+`*int`、`[]any` 与原因切片），消费方改动导出结果不会回写 `Spec`，
+因此文档元数据不会和运行时规则漂移。
+
+### 未来模板集成（可复制）
+
+`go-validate` 不导入任何 HTTP / OpenAPI 依赖；元数据落在 `Schema` 上，
+脚手架模板（如 weld / weld-template 的 `add api`）可以直接读取并渲染约束：
+
+```go
+// renderOpenAPIConstraints 由模板调用，把 Spec 转成 OpenAPI 字段约束。
+func renderOpenAPIConstraints(spec validate.Spec) (map[string]any, error) {
+    schema, err := spec.Schema()
+    if err != nil {
+        return nil, err // 有无法表达的约束：拒绝生成，避免文档与运行时不符
+    }
+
+    properties := make(map[string]any, len(schema.Fields))
+    for _, field := range schema.Fields {
+        prop := map[string]any{"type": field.Type}
+        if field.MinLength != nil {
+            prop["minLength"] = *field.MinLength
+        }
+        if field.MaxLength != nil {
+            prop["maxLength"] = *field.MaxLength
+        }
+        if field.Minimum != nil {
+            prop["minimum"] = field.Minimum
+        }
+        if field.Maximum != nil {
+            prop["maximum"] = field.Maximum
+        }
+        if field.Format != "" {
+            prop["format"] = field.Format
+        }
+        if field.Enum != nil {
+            prop["enum"] = field.Enum
+        }
+        properties[field.Name] = prop
+    }
+
+    // 消费方可用 schema.Names() 与请求结构体的 JSON 标签核对字段名。
+    required := make([]string, 0, len(schema.Fields))
+    for _, field := range schema.Fields {
+        if field.Required {
+            required = append(required, field.Name)
+        }
+    }
+    return map[string]any{"properties": properties, "required": required}, nil
+}
+```
+
 ## 设计约定
 
 - **纯函数**：规则只读取传入的值，不访问外部状态、不发起 IO。业务逻辑放到 service 层。
